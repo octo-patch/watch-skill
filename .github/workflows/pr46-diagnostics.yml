@@ -1,0 +1,87 @@
+name: PR46 focused diagnostics
+on:
+  push:
+    branches: [ci/diagnose-minimax-pr46]
+permissions:
+  contents: read
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - label: base
+            sha: f1317c8fe64744a606c31867b05fbbe3144268c6
+          - label: head
+            sha: f803cb588b925dbe07c418ad60e104c825c0286a
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: oxbshw/watch-skill
+          ref: ${{ matrix.sha }}
+          persist-credentials: false
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10.29.1
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22.19.0
+      - uses: astral-sh/setup-uv@v7
+      - name: Build and inspect actual packed inventory
+        working-directory: workspace
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/pr46-evidence"
+          git rev-parse HEAD > "$RUNNER_TEMP/pr46-evidence/source-sha.txt"
+          pnpm install --frozen-lockfile
+          npm run build
+          npm run pack > "$RUNNER_TEMP/pr46-evidence/pack.log" 2>&1
+          git status --porcelain=v1 --untracked-files=all > "$RUNNER_TEMP/pr46-evidence/pack-status.txt"
+          git diff -- inventory/packed-artifacts.json > "$RUNNER_TEMP/pr46-evidence/pack-inventory.diff"
+          cp inventory/packed-artifacts.json "$RUNNER_TEMP/pr46-evidence/packed-artifacts.json"
+      - name: Install the same packed Core runtime as browser CI
+        run: |
+          set -euo pipefail
+          core_root="$RUNNER_TEMP/deepwatch-e2e-core"
+          uv build --wheel --out-dir "$core_root/dist"
+          wheel=$(find "$core_root/dist" -maxdepth 1 -name '*.whl' -print -quit)
+          uv venv "$core_root/venv"
+          uv pip install --python "$core_root/venv" "${wheel}[loop]"
+          echo "WATCH_CORE_BIN=$core_root/venv/bin/watch-skill" >> "$GITHUB_ENV"
+      - name: Build original artifact profile
+        working-directory: workspace
+        env:
+          WATCH_MANUAL_ROOT: ${{ runner.temp }}/deepwatch-e2e-profile
+        run: node scripts/manual-profile.mjs --rebuild --from-artifacts
+      - name: Capture host startup before browser interaction
+        working-directory: workspace
+        env:
+          WATCH_MANUAL_ROOT: ${{ runner.temp }}/deepwatch-e2e-profile
+        run: |
+          set -euo pipefail
+          dsh_home="$WATCH_MANUAL_ROOT/dsh-home"
+          cli=$(node -p "require('$dsh_home/manual-profile.json').cliEntry")
+          overlay=$(node -p "require('$dsh_home/manual-profile.json').overlay")
+          DSH_HOME="$dsh_home" node "$cli" --profile web --patch "$overlay" \
+            --no-open --host 127.0.0.1 --port 8931 > "$RUNNER_TEMP/pr46-evidence/host.log" 2>&1 &
+          host_pid=$!
+          trap 'kill "$host_pid" 2>/dev/null || true; wait "$host_pid" 2>/dev/null || true' EXIT
+          ready=0
+          for attempt in $(seq 1 120); do
+            if curl --fail --silent http://127.0.0.1:8931/ >/dev/null; then ready=1; break; fi
+            if ! kill -0 "$host_pid" 2>/dev/null; then break; fi
+            sleep 1
+          done
+          echo "ready=$ready" > "$RUNNER_TEMP/pr46-evidence/host-status.txt"
+          if kill -0 "$host_pid" 2>/dev/null; then echo 'alive=true' >> "$RUNNER_TEMP/pr46-evidence/host-status.txt"; fi
+          sleep 5
+          curl --silent --output /dev/null --write-out 'http_status=%{http_code}\n' http://127.0.0.1:8931/ >> "$RUNNER_TEMP/pr46-evidence/host-status.txt" || true
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: pr46-${{ matrix.label }}
+          path: ${{ runner.temp }}/pr46-evidence
+          if-no-files-found: error
+          retention-days: 7
